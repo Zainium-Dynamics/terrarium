@@ -291,7 +291,7 @@ func openImage(iso string) (string, error) {
 	}
 	os.MkdirAll(sysDir, 0o700)
 	atCleanup(func() { os.RemoveAll(work) })
-	l, err := attach(iso, "--read-only")
+	l, err := attach(iso, true, false)
 	if err != nil {
 		return "", err
 	}
@@ -302,7 +302,7 @@ func openImage(iso string) (string, error) {
 	if _, err := os.Stat(img); err != nil {
 		return "", fmt.Errorf("%s is not a Zainium live ISO (no zaisys/zairoot.img)", iso)
 	}
-	if l, err = attach(img, "--read-only"); err != nil {
+	if l, err = attach(img, true, false); err != nil {
 		return "", err
 	}
 	if err := mountRO(l, sysDir, "erofs"); err != nil {
@@ -311,15 +311,53 @@ func openImage(iso string) (string, error) {
 	return sysDir, nil
 }
 
-// attach sets up a loop device for a file and detaches it at cleanup.
-func attach(file string, opts ...string) (string, error) {
-	out, err := exec.Command(tool("losetup"), append(append([]string{"--find", "--show"}, opts...), file)...).Output()
+// attach sets up a loop device for a file straight with the kernel (losetup differs between
+// systems, and Zainium's has no partition scan) and detaches it at cleanup.
+func attach(file string, readOnly, partscan bool) (string, error) {
+	ctl, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
 	if err != nil {
-		return "", fmt.Errorf("losetup %s: %w", file, err)
+		return "", fmt.Errorf("loop devices: %w", err)
 	}
-	l := strings.TrimSpace(string(out))
-	atCleanup(func() { exec.Command(tool("losetup"), "-d", l).Run() })
-	return l, nil
+	n, err := unix.IoctlRetInt(int(ctl.Fd()), unix.LOOP_CTL_GET_FREE)
+	ctl.Close()
+	if err != nil {
+		return "", fmt.Errorf("no free loop device: %w", err)
+	}
+	dev := fmt.Sprintf("/dev/loop%d", n)
+	mode := os.O_RDWR
+	if readOnly {
+		mode = os.O_RDONLY
+	}
+	f, err := os.OpenFile(file, mode, 0)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	l, err := os.OpenFile(dev, mode, 0)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", dev, err)
+	}
+	defer l.Close()
+	var cfg unix.LoopConfig
+	cfg.Fd = uint32(f.Fd())
+	cfg.Info.Flags = 0
+	if readOnly {
+		cfg.Info.Flags |= unix.LO_FLAGS_READ_ONLY
+	}
+	if partscan {
+		cfg.Info.Flags |= unix.LO_FLAGS_PARTSCAN
+	}
+	copy(cfg.Info.File_name[:], file)
+	if err := unix.IoctlLoopConfigure(int(l.Fd()), &cfg); err != nil {
+		return "", fmt.Errorf("loop %s on %s: %w", file, dev, err)
+	}
+	atCleanup(func() {
+		if l, err := os.Open(dev); err == nil {
+			unix.IoctlSetInt(int(l.Fd()), unix.LOOP_CLR_FD, 0)
+			l.Close()
+		}
+	})
+	return dev, nil
 }
 
 func mountRO(dev, dir, fs string) error {
@@ -357,7 +395,7 @@ func stagingImage(size int64) (string, error) {
 		return "", err
 	}
 	atCleanup(func() { os.RemoveAll(staging) })
-	return attach(img, "--partscan")
+	return attach(img, false, true)
 }
 
 // writeDrive copies the built image to the drive: the start (partition table, BIOS boot,
