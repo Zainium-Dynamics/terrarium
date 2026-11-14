@@ -86,34 +86,88 @@ func main() {
 		fail(errors.New("stopped, nothing was changed"))
 	}
 
-	src, cleanup, err := openImage(iso)
-	if cleanup != nil {
-		defer cleanup()
-	}
+	// stop cleanly on Ctrl+C: nothing stays mounted, opened or attached
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "\nterrarium: stopping, cleaning up (the drive is not usable until you run terrarium again)")
+		emergencyCleanup()
+		os.Exit(130)
+	}()
+
+	src, err := openImage(iso)
 	if err != nil {
 		fail(err)
 	}
 
+	// Building straight on a USB stick is very slow: thousands of small files and the
+	// fs-verity seal of each. So the system is built in an image on this computer's disk,
+	// the same size as the drive, and then written to the drive in long sequential runs.
+	loop, err := stagingImage(d.Size)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Println("\nBuilding Zainium OS on this computer first")
 	r := progress.NewReporter(&progress.TextWriter{W: os.Stdout})
-	e := &engine.Engine{Plan: p, R: r, Source: src}
+	sp := p
+	sp.Disk = loop
+	e := &engine.Engine{Plan: sp, R: r, Source: src, Staging: true}
 	if err := e.Run(); err != nil {
 		r.Fail(err)
-		cleanup()
-		os.Exit(1)
+		fail(errors.New("building the image failed, the drive was not touched"))
 	}
-	r.Done()
+
+	fmt.Printf("\nWriting it to %s\n", d.Path)
+	if err := writeDrive(loop, d.Path, p.Encrypt); err != nil {
+		fail(fmt.Errorf("writing the drive: %w", err))
+	}
 
 	fmt.Println("\nChecking the drive")
 	if err := check(d.Path, src, p.Encrypt); err != nil {
-		cleanup()
 		fail(fmt.Errorf("check: %w", err))
 	}
+	runCleanups()
 	fmt.Printf("\nDone. %s now starts Zainium OS on any computer: choose it in the boot menu.\n", d.Path)
+}
+
+// cleanups run in reverse at the end, on failure and on Ctrl+C.
+var cleanups []func()
+
+func atCleanup(f func()) { cleanups = append(cleanups, f) }
+
+func runCleanups() {
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
+	}
+	cleanups = nil
+}
+
+// emergencyCleanup also undoes what the engine had mounted or opened when it was stopped.
+func emergencyCleanup() {
+	for _, m := range []string{"/run/zainium-install/target", "/run/zainium-install/esp", "/run/zainium-install/source"} {
+		unix.Unmount(m, unix.MNT_DETACH)
+	}
+	for _, name := range []string{"zainium-root", "terrarium-src", "terrarium-dst", "terrarium-check"} {
+		if _, err := os.Stat("/dev/mapper/" + name); err == nil {
+			exec.Command(tool("cryptsetup"), "close", name).Run()
+		}
+	}
+	runCleanups()
 }
 
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "terrarium:", err)
+	emergencyCleanup()
 	os.Exit(1)
+}
+
+// tool finds a program on PATH, else in the base.
+func tool(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	return "/overlayer/syshub/bin/" + name
 }
 
 func listUSB() {
@@ -222,53 +276,254 @@ func hostTimezone() string {
 }
 
 // openImage mounts the ISO and the system image inside it, read-only, and returns the tree.
-func openImage(iso string) (string, func(), error) {
+func openImage(iso string) (string, error) {
 	isoDir, sysDir := filepath.Join(work, "iso"), filepath.Join(work, "system")
-	var loops, mounts []string
-	cleanup := func() {
-		for i := len(mounts) - 1; i >= 0; i-- {
-			unix.Unmount(mounts[i], unix.MNT_DETACH)
-		}
-		for _, l := range loops {
-			exec.Command("losetup", "-d", l).Run()
-		}
-		os.RemoveAll(work)
-		mounts, loops = nil, nil
-	}
-	loop := func(file string) (string, error) {
-		out, err := exec.Command("losetup", "--find", "--show", "--read-only", file).Output()
-		if err != nil {
-			return "", fmt.Errorf("losetup %s: %w", file, err)
-		}
-		l := strings.TrimSpace(string(out))
-		loops = append(loops, l)
-		return l, nil
-	}
 	if err := os.MkdirAll(isoDir, 0o700); err != nil {
-		return "", cleanup, err
+		return "", err
 	}
 	os.MkdirAll(sysDir, 0o700)
-	l, err := loop(iso)
+	atCleanup(func() { os.RemoveAll(work) })
+	l, err := attach(iso, "--read-only")
 	if err != nil {
-		return "", cleanup, err
+		return "", err
 	}
-	if err := unix.Mount(l, isoDir, "iso9660", unix.MS_RDONLY, ""); err != nil {
-		return "", cleanup, fmt.Errorf("%s is not a Zainium ISO (mount: %w)", iso, err)
+	if err := mountRO(l, isoDir, "iso9660"); err != nil {
+		return "", fmt.Errorf("%s is not a Zainium ISO (mount: %w)", iso, err)
 	}
-	mounts = append(mounts, isoDir)
 	img := filepath.Join(isoDir, "zaisys/zairoot.img")
 	if _, err := os.Stat(img); err != nil {
-		return "", cleanup, fmt.Errorf("%s is not a Zainium live ISO (no zaisys/zairoot.img)", iso)
+		return "", fmt.Errorf("%s is not a Zainium live ISO (no zaisys/zairoot.img)", iso)
 	}
-	l, err = loop(img)
+	if l, err = attach(img, "--read-only"); err != nil {
+		return "", err
+	}
+	if err := mountRO(l, sysDir, "erofs"); err != nil {
+		return "", fmt.Errorf("mount the system image (does this kernel have erofs?): %w", err)
+	}
+	return sysDir, nil
+}
+
+// attach sets up a loop device for a file and detaches it at cleanup.
+func attach(file string, opts ...string) (string, error) {
+	out, err := exec.Command(tool("losetup"), append(append([]string{"--find", "--show"}, opts...), file)...).Output()
 	if err != nil {
-		return "", cleanup, err
+		return "", fmt.Errorf("losetup %s: %w", file, err)
 	}
-	if err := unix.Mount(l, sysDir, "erofs", unix.MS_RDONLY, ""); err != nil {
-		return "", cleanup, fmt.Errorf("mount the system image (does this kernel have erofs?): %w", err)
+	l := strings.TrimSpace(string(out))
+	atCleanup(func() { exec.Command(tool("losetup"), "-d", l).Run() })
+	return l, nil
+}
+
+func mountRO(dev, dir, fs string) error {
+	if err := unix.Mount(dev, dir, fs, unix.MS_RDONLY, ""); err != nil {
+		return err
 	}
-	mounts = append(mounts, sysDir)
-	return sysDir, cleanup, nil
+	atCleanup(func() { unix.Unmount(dir, unix.MNT_DETACH) })
+	return nil
+}
+
+// staging is where the drive is built first, on this computer's own disk.
+const staging = "/var/tmp/terrarium"
+
+// stagingImage makes a sparse image of the drive's size and attaches it with partitions.
+func stagingImage(size int64) (string, error) {
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		return "", err
+	}
+	var st unix.Statfs_t
+	if unix.Statfs(staging, &st) == nil {
+		if free := int64(st.Bavail) * st.Bsize; free < 14<<30 {
+			return "", fmt.Errorf("%s has %s free; building the drive needs about 14 GB there for a while", staging, disk.HumanSize(free))
+		}
+	}
+	img := filepath.Join(staging, "drive.img")
+	os.Remove(img)
+	f, err := os.Create(img)
+	if err != nil {
+		return "", err
+	}
+	err = f.Truncate(size)
+	f.Close()
+	if err != nil {
+		return "", err
+	}
+	atCleanup(func() { os.RemoveAll(staging) })
+	return attach(img, "--partscan")
+}
+
+// writeDrive copies the built image to the drive: the start (partition table, BIOS boot,
+// EFI partition) and the backup partition table byte for byte, and of the root only the
+// blocks the file system uses (e2image), through LUKS when it is encrypted.
+func writeDrive(loop, dev, passphrase string) error {
+	start, size, err := partExtent(loop, disk.PartRoot)
+	if err != nil {
+		return err
+	}
+	img, err := os.Open(loop)
+	if err != nil {
+		return err
+	}
+	defer img.Close()
+	out, err := os.OpenFile(dev, os.O_WRONLY|unix.O_EXCL, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dev, err)
+	}
+	total, err := out.Seek(0, io.SeekEnd)
+	if err != nil {
+		out.Close()
+		return err
+	}
+	if err := copyRange(img, out, 0, start, "partition table and boot partitions"); err != nil {
+		out.Close()
+		return err
+	}
+	if err := copyRange(img, out, start+size, total-(start+size), "backup partition table"); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	out.Close()
+
+	// the kernel reads the new partition table
+	if f, err := os.Open(dev); err == nil {
+		disk.Reread(f)
+		f.Close()
+	}
+	exec.Command(tool("udevadm"), "settle", "--timeout=10").Run()
+	srcRoot, dstRoot := disk.PartitionPath(loop, disk.PartRoot), disk.PartitionPath(dev, disk.PartRoot)
+	if err := disk.WaitFor(dstRoot, 15e9); err != nil {
+		return err
+	}
+
+	if passphrase != "" {
+		hdr, err := luksDataOffset(srcRoot)
+		if err != nil {
+			return err
+		}
+		si, err := os.Open(srcRoot)
+		if err != nil {
+			return err
+		}
+		so, err := os.OpenFile(dstRoot, os.O_WRONLY, 0)
+		if err != nil {
+			si.Close()
+			return err
+		}
+		err = copyRange(si, so, 0, hdr, "encryption header")
+		if err == nil {
+			err = so.Sync()
+		}
+		si.Close()
+		so.Close()
+		if err != nil {
+			return err
+		}
+		if err := luksOpen(srcRoot, "terrarium-src", passphrase, true); err != nil {
+			return err
+		}
+		defer exec.Command(tool("cryptsetup"), "close", "terrarium-src").Run()
+		if err := luksOpen(dstRoot, "terrarium-dst", passphrase, false); err != nil {
+			return err
+		}
+		defer exec.Command(tool("cryptsetup"), "close", "terrarium-dst").Run()
+		srcRoot, dstRoot = "/dev/mapper/terrarium-src", "/dev/mapper/terrarium-dst"
+	}
+	fmt.Println("  the system, only the blocks it uses")
+	c := exec.Command(tool("e2image"), "-ra", "-p", srcRoot, dstRoot)
+	c.Stdout, c.Stderr = os.Stdout, os.Stderr
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("e2image: %w", err)
+	}
+	unix.Sync()
+	return nil
+}
+
+// partExtent is where a partition of a disk starts and how long it is, in bytes.
+func partExtent(dev string, n int) (int64, int64, error) {
+	sys := filepath.Join("/sys/class/block", filepath.Base(disk.PartitionPath(dev, n)))
+	read := func(f string) (int64, error) {
+		b, err := os.ReadFile(filepath.Join(sys, f))
+		if err != nil {
+			return 0, err
+		}
+		var v int64
+		_, err = fmt.Sscan(string(b), &v)
+		return v * 512, err
+	}
+	start, err := read("start")
+	if err != nil {
+		return 0, 0, fmt.Errorf("partition %d of %s: %w", n, dev, err)
+	}
+	size, err := read("size")
+	return start, size, err
+}
+
+// copyRange copies n bytes at off from src to the same offset of dst, showing progress.
+func copyRange(src, dst *os.File, off, n int64, what string) error {
+	if _, err := dst.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+	buf := make([]byte, 4<<20)
+	r := io.NewSectionReader(src, off, n)
+	var done int64
+	last := int64(-1)
+	for {
+		k, err := r.Read(buf)
+		if k > 0 {
+			if _, werr := dst.Write(buf[:k]); werr != nil {
+				return werr
+			}
+			done += int64(k)
+			if pct := done * 100 / max(n, 1); pct/10 != last/10 {
+				last = pct
+				fmt.Printf("  %s: %s of %s\n", what, disk.HumanSize(done), disk.HumanSize(n))
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// luksDataOffset is the size of the LUKS2 header area: where the encrypted data begins.
+func luksDataOffset(dev string) (int64, error) {
+	out, err := exec.Command(tool("cryptsetup"), "luksDump", dev).Output()
+	if err != nil {
+		return 0, fmt.Errorf("cryptsetup luksDump %s: %w", dev, err)
+	}
+	seg := false
+	for _, line := range strings.Split(string(out), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "Data segments:") {
+			seg = true
+		}
+		var v int64
+		if seg && strings.HasPrefix(t, "offset:") {
+			if _, err := fmt.Sscanf(t, "offset: %d", &v); err == nil && v > 0 {
+				return v, nil
+			}
+		}
+	}
+	return 0, errors.New("no data offset in the LUKS header")
+}
+
+func luksOpen(dev, name, key string, ro bool) error {
+	args := []string{"open", "--key-file=-"}
+	if ro {
+		args = append(args, "--readonly")
+	}
+	c := exec.Command(tool("cryptsetup"), append(args, dev, name)...)
+	c.Stdin = strings.NewReader(key)
+	if out, err := c.CombinedOutput(); err != nil {
+		return fmt.Errorf("cryptsetup open %s: %v: %s", dev, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // check mounts the finished drive read-only and compares it with the image: the boot files on
@@ -277,7 +532,7 @@ func check(dev, src, passphrase string) error {
 	espDir, rootDir := filepath.Join(work, "check-esp"), filepath.Join(work, "check-root")
 	os.MkdirAll(espDir, 0o700)
 	os.MkdirAll(rootDir, 0o700)
-	exec.Command("udevadm", "settle").Run()
+	exec.Command(tool("udevadm"), "settle").Run()
 
 	esp := disk.PartitionPath(dev, disk.PartESP)
 	if err := unix.Mount(esp, espDir, "vfat", unix.MS_RDONLY, ""); err != nil {
@@ -293,12 +548,12 @@ func check(dev, src, passphrase string) error {
 
 	rootPart := disk.PartitionPath(dev, disk.PartRoot)
 	if passphrase != "" {
-		c := exec.Command("cryptsetup", "open", "--readonly", "--key-file=-", rootPart, "terrarium-check")
+		c := exec.Command(tool("cryptsetup"), "open", "--readonly", "--key-file=-", rootPart, "terrarium-check")
 		c.Stdin = strings.NewReader(passphrase)
 		if out, err := c.CombinedOutput(); err != nil {
 			return fmt.Errorf("open the encrypted root: %v: %s", err, out)
 		}
-		defer exec.Command("cryptsetup", "close", "terrarium-check").Run()
+		defer exec.Command(tool("cryptsetup"), "close", "terrarium-check").Run()
 		rootPart = "/dev/mapper/terrarium-check"
 		ok("encrypted root opens with the passphrase")
 	}
@@ -321,6 +576,16 @@ func check(dev, src, passphrase string) error {
 		}
 	}
 	ok("kernel and initramfs match the image")
+
+	// the base is sealed: fs-verity is on, and reading a sealed file checks it block by block
+	var stx unix.Statx_t
+	if err := unix.Statx(unix.AT_FDCWD, filepath.Join(rootDir, "overlayer/zaisys/kernel/linux-zainium"), 0, unix.STATX_BASIC_STATS, &stx); err != nil {
+		return err
+	}
+	if stx.Attributes&unix.STATX_ATTR_VERITY == 0 {
+		return errors.New("the base on the drive is not sealed with fs-verity")
+	}
+	ok("the base is sealed with fs-verity")
 
 	want, got := 0, 0
 	for _, top := range []string{"overlayer/syshub", "overlayer/zaisys"} {
