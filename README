@@ -19,6 +19,12 @@ It runs as root:
 
     elevate terrarium zainium-live-2026.11.13.iso /dev/sdc
 
+It works on any Linux. The programs it needs (mkfs.ext4, e2image,
+cryptsetup, limine) come from the ISO itself and run with the ISO's own
+loader and libraries, so nothing has to be installed first. The computer's
+kernel needs loop devices, EROFS and ext4 fs-verity, which current
+distributions have.
+
 terrarium uses the install engine of the Zainium installer
 (github.com/Zainium-Dynamics/zainium-installer, pkg/), so the drive holds the
 same system the installer makes.

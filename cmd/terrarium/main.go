@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"debug/elf"
 	"errors"
 	"flag"
 	"fmt"
@@ -98,6 +99,9 @@ func main() {
 
 	src, err := openImage(iso)
 	if err != nil {
+		fail(err)
+	}
+	if err := useImageTools(src); err != nil {
 		fail(err)
 	}
 
@@ -366,6 +370,61 @@ func mountRO(dev, dir, fs string) error {
 	}
 	atCleanup(func() { unix.Unmount(dir, unix.MNT_DETACH) })
 	return nil
+}
+
+// imageTools are the programs terrarium and the engine run. They are taken from the ISO's own
+// system, with its own musl loader and libraries, so terrarium works on any Linux and always
+// makes the drive with the same tools as the installer.
+var imageTools = []string{"mkfs.ext4", "e2image", "cryptsetup", "limine"}
+
+// useImageTools writes a small wrapper for each of them and puts their directory first on PATH.
+func useImageTools(sys string) error {
+	base := filepath.Join(sys, "overlayer/syshub")
+	loader := filepath.Join(base, "x86_64-zainium-linux-musl/lib/ld-musl-x86_64.so.1")
+	libs := filepath.Join(base, "lib") + ":" + filepath.Join(base, "x86_64-zainium-linux-musl/lib")
+	bin := filepath.Join(work, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		return err
+	}
+	for _, t := range imageTools {
+		prog := ""
+		for _, dir := range []string{"bin", "sbin"} {
+			if _, err := os.Stat(filepath.Join(base, dir, t)); err == nil {
+				prog = filepath.Join(base, dir, t)
+				break
+			}
+		}
+		if prog == "" {
+			return fmt.Errorf("the ISO has no %s", t)
+		}
+		run := fmt.Sprintf("exec %q \"$@\"\n", prog)
+		if dynamic(prog) {
+			run = fmt.Sprintf("exec %q --library-path %q --argv0 %q %q \"$@\"\n", loader, libs, t, prog)
+		}
+		if err := os.WriteFile(filepath.Join(bin, t), []byte("#!/bin/sh\n"+run), 0o700); err != nil {
+			return err
+		}
+	}
+	os.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	if out, err := exec.Command(tool("mkfs.ext4"), "-V").CombinedOutput(); err != nil {
+		return fmt.Errorf("running mkfs.ext4 from the ISO: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// dynamic says whether an ELF program needs a loader.
+func dynamic(path string) bool {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			return true
+		}
+	}
+	return false
 }
 
 // staging is where the drive is built first: next to the ISO, on this computer's own disk,
