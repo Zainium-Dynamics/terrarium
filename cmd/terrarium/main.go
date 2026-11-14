@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -537,14 +538,64 @@ func writeDrive(loop, dev, passphrase string) error {
 		defer exec.Command(tool("cryptsetup"), "close", "terrarium-dst").Run()
 		srcRoot, dstRoot = "/dev/mapper/terrarium-src", "/dev/mapper/terrarium-dst"
 	}
-	fmt.Println("  the system, only the blocks it uses")
+	fmt.Println("  the system, only the blocks it uses (then the drive finishes writing, which can take a while on a slow stick)")
 	c := exec.Command(tool("e2image"), "-ra", "-p", srcRoot, dstRoot)
 	c.Stdout, c.Stderr = os.Stdout, os.Stderr
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("e2image: %w", err)
 	}
-	unix.Sync()
+	flush(dev)
 	return nil
+}
+
+// flush waits for the data still in memory to reach the drive, saying how much is left:
+// a USB stick can slow down a lot at the end, and a silent wait looks like a hang.
+func flush(dev string) {
+	done := make(chan struct{})
+	go func() {
+		unix.Sync()
+		close(done)
+	}()
+	stat := filepath.Join("/sys/class/block", filepath.Base(dev), "stat")
+	written := func() int64 {
+		b, _ := os.ReadFile(stat)
+		f := strings.Fields(string(b))
+		if len(f) < 7 {
+			return 0
+		}
+		var v int64
+		fmt.Sscan(f[6], &v)
+		return v * 512
+	}
+	last := written()
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			fmt.Println("  all data is on the drive")
+			return
+		case <-t.C:
+			now := written()
+			fmt.Printf("  finishing writes to the drive: %s left, %s/s\n", disk.HumanSize(pendingWrites()), disk.HumanSize((now-last)/5))
+			last = now
+		}
+	}
+}
+
+// pendingWrites is how much written data the kernel still holds in memory.
+func pendingWrites() int64 {
+	b, _ := os.ReadFile("/proc/meminfo")
+	var total int64
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && (f[0] == "Dirty:" || f[0] == "Writeback:") {
+			var kb int64
+			fmt.Sscan(f[1], &kb)
+			total += kb << 10
+		}
+	}
+	return total
 }
 
 // partExtent is where a partition of a disk starts and how long it is, in bytes.
