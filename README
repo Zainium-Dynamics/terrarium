@@ -1,0 +1,32 @@
+terrarium
+=========
+
+Puts an installed Zainium OS on a USB drive, straight from the ISO.
+
+The drive then starts any computer, UEFI or BIOS, and keeps your files and
+apps, like an installed system. It can be encrypted.
+
+    terrarium --list                     the USB drives on this computer
+    terrarium <iso> <usb>                install Zainium OS on the drive
+    terrarium --encrypt <iso> <usb>      the same, encrypted
+
+It asks for your name, a user name and a password, then for the drive name
+before it erases anything. It only writes to USB drives, never to the disk
+the computer runs from. At the end it checks the drive once: the boot files,
+the kernel and initramfs, and every file of the base.
+
+It runs as root:
+
+    elevate terrarium zainium-live-2026.11.13.iso /dev/sdc
+
+terrarium uses the install engine of the Zainium installer
+(github.com/Zainium-Dynamics/zainium-installer, pkg/), so the drive holds the
+same system the installer makes.
+
+Build
+-----
+
+    make
+    make install DESTDIR=<root>
+
+License: GPL-3.0
