@@ -104,6 +104,7 @@ func main() {
 	// Building straight on a USB stick is very slow: thousands of small files and the
 	// fs-verity seal of each. So the system is built in an image on this computer's disk,
 	// the same size as the drive, and then written to the drive in long sequential runs.
+	staging = filepath.Join(filepath.Dir(absPath(iso)), ".terrarium")
 	loop, err := stagingImage(d.Size)
 	if err != nil {
 		fail(err)
@@ -160,6 +161,13 @@ func fail(err error) {
 	fmt.Fprintln(os.Stderr, "terrarium:", err)
 	emergencyCleanup()
 	os.Exit(1)
+}
+
+func absPath(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return p
 }
 
 // tool finds a program on PATH, else in the base.
@@ -322,8 +330,9 @@ func mountRO(dev, dir, fs string) error {
 	return nil
 }
 
-// staging is where the drive is built first, on this computer's own disk.
-const staging = "/var/tmp/terrarium"
+// staging is where the drive is built first: next to the ISO, on this computer's own disk,
+// where there is room to write (in Zainium /var/tmp is part of the sealed base).
+var staging string
 
 // stagingImage makes a sparse image of the drive's size and attaches it with partitions.
 func stagingImage(size int64) (string, error) {
