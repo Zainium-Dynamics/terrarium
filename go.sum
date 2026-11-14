@@ -1,2 +1,4 @@
+github.com/Zainium-Dynamics/zainium_installer v0.0.0-20261114195442-c4d4a02ab08d h1:R9Wd7EjIA9zzQA28uFfcKYPnt6pddu9tHfB42itKsTc=
+github.com/Zainium-Dynamics/zainium_installer v0.0.0-20261114195442-c4d4a02ab08d/go.mod h1:7cKrGQyDCdBeP7NJpknmXaBzfLt9a17j6J/P+HkMeWo=
 golang.org/x/sys v0.46.0 h1:noSf2Fq6F8DBgS+LysIkx7rIExoNHJsxOAtPp4rthXw=
 golang.org/x/sys v0.46.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
