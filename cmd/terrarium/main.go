@@ -136,7 +136,7 @@ func main() {
 	}
 
 	fmt.Println("\nChecking the drive")
-	if err := check(d.Path, src, p.Encrypt); err != nil {
+	if err := check(d.Path, src, p.Encrypt, loop); err != nil {
 		fail(fmt.Errorf("check: %w", err))
 	}
 	runCleanups()
@@ -696,7 +696,7 @@ func luksOpen(dev, name, key string, ro bool) error {
 
 // check mounts the finished drive read-only and compares it with the image: the boot files on
 // the EFI partition, the kernel and initramfs, and that every base file was copied.
-func check(dev, src, passphrase string) error {
+func check(dev, src, passphrase, loop string) error {
 	espDir, rootDir := filepath.Join(work, "check-esp"), filepath.Join(work, "check-root")
 	os.MkdirAll(espDir, 0o700)
 	os.MkdirAll(rootDir, 0o700)
@@ -755,22 +755,39 @@ func check(dev, src, passphrase string) error {
 	}
 	ok("the base is sealed with fs-verity")
 
-	want, got := 0, 0
+	// every file of the base is on the drive: the drive is compared with the image it was
+	// written from (the ISO has a few files more, which the install removes on purpose)
+	imgDir := filepath.Join(work, "check-image")
+	os.MkdirAll(imgDir, 0o700)
+	imgRoot := disk.PartitionPath(loop, disk.PartRoot)
+	if passphrase != "" {
+		if err := luksOpen(imgRoot, "terrarium-src", passphrase, true); err != nil {
+			return err
+		}
+		defer exec.Command(tool("cryptsetup"), "close", "terrarium-src").Run()
+		imgRoot = "/dev/mapper/terrarium-src"
+	}
+	if err := unix.Mount(imgRoot, imgDir, "ext4", unix.MS_RDONLY, "noload"); err != nil {
+		return fmt.Errorf("mount the built image %s: %w", imgRoot, err)
+	}
+	defer unix.Unmount(imgDir, 0)
+	want := 0
+	var missing []string
 	for _, top := range []string{"overlayer/syshub", "overlayer/zaisys"} {
-		filepath.WalkDir(filepath.Join(src, top), func(p string, de os.DirEntry, err error) error {
+		filepath.WalkDir(filepath.Join(imgDir, top), func(p string, de os.DirEntry, err error) error {
 			if err != nil || de.IsDir() {
 				return nil
 			}
 			want++
-			rel, _ := filepath.Rel(src, p)
-			if _, err := os.Lstat(filepath.Join(rootDir, rel)); err == nil {
-				got++
+			rel, _ := filepath.Rel(imgDir, p)
+			if _, err := os.Lstat(filepath.Join(rootDir, rel)); err != nil {
+				missing = append(missing, rel)
 			}
 			return nil
 		})
 	}
-	if got < want {
-		return fmt.Errorf("%d of %d base files are missing", want-got, want)
+	if len(missing) > 0 {
+		return fmt.Errorf("%d of %d base files are missing on the drive, for example %s", len(missing), want, strings.Join(missing[:min(len(missing), 5)], ", "))
 	}
 	ok(fmt.Sprintf("all %d base files are on the drive", want))
 	return nil
