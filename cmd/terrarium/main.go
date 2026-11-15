@@ -105,6 +105,12 @@ func main() {
 	if err := useImageTools(src); err != nil {
 		fail(err)
 	}
+	// a run that was stopped can leave its encrypted mappings open
+	for _, name := range []string{"zainium-root", "terrarium-src", "terrarium-dst", "terrarium-check"} {
+		if _, err := os.Stat("/dev/mapper/" + name); err == nil {
+			exec.Command(tool("cryptsetup"), "close", name).Run()
+		}
+	}
 
 	// Building straight on a USB stick is very slow: thousands of small files and the
 	// fs-verity seal of each. So the system is built in an image on this computer's disk,
