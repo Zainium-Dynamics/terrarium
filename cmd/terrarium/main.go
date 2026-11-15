@@ -402,6 +402,11 @@ func useImageTools(sys string) error {
 		if dynamic(prog) {
 			run = fmt.Sprintf("exec %q --library-path %q --argv0 %q %q \"$@\"\n", loader, libs, t, prog)
 		}
+		if t == "cryptsetup" {
+			// the computer's udev may not answer device-mapper (an old or missing dmsetup),
+			// and cryptsetup would wait for it forever: it makes the device nodes itself
+			run = "DM_DISABLE_UDEV=1 " + run
+		}
 		if err := os.WriteFile(filepath.Join(bin, t), []byte("#!/bin/sh\n"+run), 0o700); err != nil {
 			return err
 		}
